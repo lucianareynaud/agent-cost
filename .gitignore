@@ -1,0 +1,11 @@
+# Cost data (local to each user)
+*.csv
+.agent-cost/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

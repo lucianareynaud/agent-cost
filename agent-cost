@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# agent-cost — FinOps cost attribution for AI code agents
+# Tracks per-commit cost across Kiro, Cursor, Claude Code, Copilot, and others.
+#
+# Usage:
+#   agent-cost log <cost> <task_type> [options]   — log last commit's cost
+#   agent-cost report [--agent <name>]            — Pareto report
+#   agent-cost tail [n]                           — last n entries
+#   agent-cost export                             — CSV path for pipeline integration
+#   agent-cost summary --since <date>             — period summary (YYYY-MM-DD)
+#
+# Options for 'log':
+#   -a, --agent <name>     Agent name: kiro|cursor|claude-code|copilot|other (default: kiro)
+#   -e, --elapsed <secs>   Elapsed time in seconds
+#   -u, --unit <unit>      Cost unit: credits|requests|usd|tokens (default: credits)
+#   -m, --manual           Skip git auto-detection, prompt for details
+#
+# Task types:
+#   fix    — bug fix, lint, type error        (low complexity, high waste signal)
+#   feat   — new feature, multi-file change   (expected high cost)
+#   refac  — refactor, rename, restructure
+#   test   — test creation or modification
+#   doc    — documentation, comments
+#   config — CI, deps, config files
+#   other  — uncategorized
+
+set -euo pipefail
+
+AGENT_COST_DIR="${AGENT_COST_DIR:-$HOME/.agent-cost}"
+AGENT_COST_CSV="${AGENT_COST_DIR}/costs.csv"
+HEADER="timestamp,agent,cost,cost_unit,elapsed_s,task_type,files_changed,insertions,deletions,commit_hash,commit_msg"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+_ensure_csv() {
+  mkdir -p "$AGENT_COST_DIR"
+  if [[ ! -f "$AGENT_COST_CSV" ]]; then
+    echo "$HEADER" > "$AGENT_COST_CSV"
+  fi
+}
+
+_parse_git_last_commit() {
+  local hash msg files ins del shortstat
+  hash=$(git log -1 --format='%h' 2>/dev/null) || { echo "ERROR: not in a git repo or no commits" >&2; return 1; }
+  msg=$(git log -1 --format='%s' 2>/dev/null | sed 's/"/""/g')
+  shortstat=$(git log -1 --shortstat --format='' 2>/dev/null)
+  files=$(echo "$shortstat" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo "0")
+  ins=$(echo "$shortstat" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0")
+  del=$(echo "$shortstat" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo "0")
+  echo "${hash}|${msg}|${files}|${ins}|${del}"
+}
+
+_validate_task_type() {
+  local tt="$1"
+  case "$tt" in
+    fix|feat|refac|test|doc|config|other) return 0 ;;
+    *) echo "ERROR: invalid task type '$tt'. Use: fix|feat|refac|test|doc|config|other" >&2; return 1 ;;
+  esac
+}
+
+_validate_agent() {
+  local ag="$1"
+  case "$ag" in
+    kiro|cursor|claude-code|copilot|other) return 0 ;;
+    *) echo "ERROR: invalid agent '$ag'. Use: kiro|cursor|claude-code|copilot|other" >&2; return 1 ;;
+  esac
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_log() {
+  local cost="" task_type="" agent="kiro" elapsed="0" unit="credits" manual=false
+
+  # Parse positional + flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--agent)   agent="$2"; shift 2 ;;
+      -e|--elapsed) elapsed="$2"; shift 2 ;;
+      -u|--unit)    unit="$2"; shift 2 ;;
+      -m|--manual)  manual=true; shift ;;
+      -*)           echo "Unknown flag: $1" >&2; return 1 ;;
+      *)
+        if [[ -z "$cost" ]]; then
+          cost="$1"
+        elif [[ -z "$task_type" ]]; then
+          task_type="$1"
+        else
+          elapsed="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -z "$cost" ]] && { echo "Usage: agent-cost log <cost> <task_type> [-a agent] [-e elapsed] [-u unit]" >&2; return 1; }
+  [[ -z "$task_type" ]] && { echo "Usage: agent-cost log <cost> <task_type> [-a agent] [-e elapsed] [-u unit]" >&2; return 1; }
+
+  _validate_task_type "$task_type" || return 1
+  _validate_agent "$agent" || return 1
+  _ensure_csv
+
+  local hash msg files ins del
+  if [[ "$manual" == true ]]; then
+    hash="manual"
+    msg="manual entry"
+    files="0"; ins="0"; del="0"
+  else
+    local git_data
+    git_data=$(_parse_git_last_commit) || return 1
+    IFS='|' read -r hash msg files ins del <<< "$git_data"
+  fi
+
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  echo "${ts},${agent},${cost},${unit},${elapsed},${task_type},${files},${ins},${del},${hash},\"${msg}\"" >> "$AGENT_COST_CSV"
+
+  local total_lines=$((ins + del))
+  local cost_per_line
+  if [[ "$total_lines" -gt 0 ]]; then
+    cost_per_line=$(echo "scale=3; ${cost} / ${total_lines}" | bc)
+  else
+    cost_per_line="N/A"
+  fi
+
+  printf "✓ %s | %.2f %s | %s | +%s/-%s (%s/line) | %s\n" \
+    "$agent" "$cost" "$unit" "$task_type" "$ins" "$del" "$cost_per_line" "$hash"
+}
+
+cmd_report() {
+  _ensure_csv
+  local filter_agent=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--agent) filter_agent="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local total_entries
+  total_entries=$(tail -n +2 "$AGENT_COST_CSV" | wc -l | tr -d ' ')
+
+  if [[ "$total_entries" -eq 0 ]]; then
+    echo "No entries yet. Use: agent-cost log <cost> <task_type>"
+    return 0
+  fi
+
+  local filter_label="ALL AGENTS"
+  [[ -n "$filter_agent" ]] && filter_label="AGENT: $filter_agent"
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  CODE AGENT COST REPORT — $(date +%Y-%m-%d) — ${filter_label}"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+
+  # Overall stats (with optional agent filter)
+  awk -F',' -v fa="$filter_agent" '
+  NR>1 {
+    if (fa != "" && $2 != fa) next
+    cost += $3
+    entries++
+    ins += $8
+    del += $9
+  }
+  END {
+    lines = ins + del
+    printf "  Total entries:     %d\n", entries
+    printf "  Total cost:        %.2f\n", cost
+    printf "  Total lines:       %d (+%d / -%d)\n", lines, ins, del
+    if (entries > 0) printf "  Avg cost/task:     %.3f\n", cost/entries
+    if (lines > 0)   printf "  Avg cost/line:     %.3f\n", cost/lines
+  }' "$AGENT_COST_CSV"
+
+  # By agent
+  echo ""
+  echo "───────────────────────────────────────────────────────────────"
+  echo "  BY AGENT"
+  echo "───────────────────────────────────────────────────────────────"
+  echo ""
+  printf "  %-14s %6s %8s %8s %7s %10s\n" "AGENT" "COUNT" "COST" "UNIT" "LINES" "COST/LINE"
+  printf "  %-14s %6s %8s %8s %7s %10s\n" "──────────────" "──────" "────────" "────────" "───────" "──────────"
+
+  awk -F',' -v fa="$filter_agent" '
+  NR>1 {
+    if (fa != "" && $2 != fa) next
+    ag = $2
+    cost[ag] += $3
+    count[ag]++
+    lines[ag] += ($8 + $9)
+    unit[ag] = $4
+  }
+  END {
+    for (a in cost) {
+      cpl = (lines[a] > 0) ? sprintf("%.3f", cost[a]/lines[a]) : "N/A"
+      printf "  %-14s %6d %8.2f %8s %7d %10s\n", a, count[a], cost[a], unit[a], lines[a], cpl
+    }
+  }' "$AGENT_COST_CSV"
+
+  # By task type
+  echo ""
+  echo "───────────────────────────────────────────────────────────────"
+  echo "  BY TASK TYPE (sorted by total cost)"
+  echo "───────────────────────────────────────────────────────────────"
+  echo ""
+  printf "  %-8s %6s %8s %7s %10s %10s\n" "TYPE" "COUNT" "COST" "LINES" "COST/LINE" "AVG_SECS"
+  printf "  %-8s %6s %8s %7s %10s %10s\n" "────────" "──────" "────────" "───────" "──────────" "──────────"
+
+  awk -F',' -v fa="$filter_agent" '
+  NR>1 {
+    if (fa != "" && $2 != fa) next
+    tt = $6
+    cost[tt] += $3
+    count[tt]++
+    lines[tt] += ($8 + $9)
+    elapsed[tt] += $5
+  }
+  END {
+    PROCINFO["sorted_in"] = "@val_num_desc"
+    for (t in cost) {
+      cpl = (lines[t] > 0) ? sprintf("%.3f", cost[t]/lines[t]) : "N/A"
+      avg_s = (count[t] > 0) ? sprintf("%.0f", elapsed[t]/count[t]) : "0"
+      printf "  %-8s %6d %8.2f %7d %10s %10s\n", t, count[t], cost[t], lines[t], cpl, avg_s
+    }
+  }' "$AGENT_COST_CSV"
+
+  # Waste candidates
+  echo ""
+  echo "───────────────────────────────────────────────────────────────"
+  echo "  WASTE CANDIDATES (fix/doc/config with cost > 0.50)"
+  echo "───────────────────────────────────────────────────────────────"
+  echo ""
+
+  local found_waste=false
+  while IFS= read -r line; do
+    found_waste=true
+    echo "  $line"
+  done < <(awk -F',' -v fa="$filter_agent" '
+  NR>1 && ($6 == "fix" || $6 == "doc" || $6 == "config") && $3 > 0.50 {
+    if (fa != "" && $2 != fa) next
+    printf "%.2f %s | %-12s | %s | +%s/-%s | %s\n", $3, $4, $2, $6, $8, $9, $10
+  }' "$AGENT_COST_CSV")
+
+  if [[ "$found_waste" == false ]]; then
+    echo "  (none — good cost hygiene)"
+  fi
+
+  echo ""
+}
+
+cmd_tail() {
+  _ensure_csv
+  local n="${1:-10}"
+  echo ""
+  printf "  %-20s %-12s %7s %-8s %6s %7s\n" "TIMESTAMP" "AGENT" "COST" "TYPE" "LINES" "HASH"
+  printf "  %-20s %-12s %7s %-8s %6s %7s\n" "────────────────────" "────────────" "───────" "────────" "──────" "───────"
+  tail -n "$n" "$AGENT_COST_CSV" | awk -F',' '$1 != "timestamp" {
+    printf "  %-20s %-12s %7.2f %-8s %6d %7s\n", $1, $2, $3, $6, ($8+$9), $10
+  }'
+  echo ""
+}
+
+cmd_summary() {
+  _ensure_csv
+  local since=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since) since="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  [[ -z "$since" ]] && { echo "Usage: agent-cost summary --since YYYY-MM-DD" >&2; return 1; }
+
+  echo ""
+  echo "  Period: ${since} → now"
+  echo ""
+
+  awk -F',' -v since="$since" '
+  NR>1 && $1 >= since {
+    ag = $2
+    cost[ag] += $3
+    count[ag]++
+    lines[ag] += ($8 + $9)
+    total_cost += $3
+    total_count++
+    total_lines += ($8 + $9)
+
+    tt = $6
+    tt_cost[tt] += $3
+    tt_count[tt]++
+  }
+  END {
+    printf "  Total: %.2f cost / %d tasks / %d lines\n\n", total_cost, total_count, total_lines
+
+    printf "  %-14s %6s %8s %8s\n", "AGENT", "TASKS", "COST", "% TOTAL"
+    printf "  %-14s %6s %8s %8s\n", "──────────────", "──────", "────────", "────────"
+    for (a in cost) {
+      pct = (total_cost > 0) ? sprintf("%.1f%%", cost[a]/total_cost*100) : "0%"
+      printf "  %-14s %6d %8.2f %8s\n", a, count[a], cost[a], pct
+    }
+
+    printf "\n  Highest waste type: "
+    max_cpl = 0; max_tt = ""
+    for (t in tt_cost) {
+      if (t == "feat" || t == "refac") continue
+      if (tt_count[t] > 0 && tt_cost[t]/tt_count[t] > max_cpl) {
+        max_cpl = tt_cost[t]/tt_count[t]
+        max_tt = t
+      }
+    }
+    if (max_tt != "") printf "%s (%.2f avg cost/task)\n", max_tt, max_cpl
+    else printf "(none)\n"
+  }' "$AGENT_COST_CSV"
+  echo ""
+}
+
+cmd_export() {
+  _ensure_csv
+  echo "$AGENT_COST_CSV"
+}
+
+# ── Router ───────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  log)      shift; cmd_log "$@" ;;
+  report)   shift; cmd_report "$@" ;;
+  tail)     shift; cmd_tail "$@" ;;
+  summary)  shift; cmd_summary "$@" ;;
+  export)   cmd_export ;;
+  -h|--help|help)
+    cat <<'EOF'
+agent-cost — FinOps cost attribution for AI code agents
+
+Usage:
+  agent-cost log <cost> <task_type> [options]   Log cost for last commit
+  agent-cost report [--agent <name>]            Pareto cost breakdown
+  agent-cost tail [n]                           Last n entries
+  agent-cost summary --since YYYY-MM-DD         Period summary
+  agent-cost export                             Print CSV path
+
+Log options:
+  -a, --agent <name>     kiro|cursor|claude-code|copilot|other (default: kiro)
+  -e, --elapsed <secs>   Elapsed time in seconds
+  -u, --unit <unit>      credits|requests|usd|tokens (default: credits)
+  -m, --manual           Skip git auto-detection
+
+Task types: fix | feat | refac | test | doc | config | other
+
+Examples:
+  agent-cost log 1.26 fix -a kiro -e 36
+  agent-cost log 0.15 feat -a claude-code -u usd -e 240
+  agent-cost log 1 fix -a cursor -u requests
+  agent-cost report --agent cursor
+  agent-cost summary --since 2025-03-01
+EOF
+    ;;
+  "")
+    echo "Usage: agent-cost <log|report|tail|summary|export|help>"
+    ;;
+  *)
+    # Shorthand: agent-cost <cost> <type> → agent-cost log <cost> <type>
+    cmd_log "$@"
+    ;;
+esac
