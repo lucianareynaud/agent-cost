@@ -242,7 +242,7 @@ alias acr="agent-cost report"
 
 ## Architecture note
 
-This tool operates at the **developer loop** level — manual attribution of agent cost to git commits. For **production pipeline** cost attribution (per-request, per-tenant, per-model), see architectures like [llmscope](https://github.com/lucianareynaud/llmscope), which instruments LLM gateways with OpenTelemetry for real-time cost, latency, and drift observability.
+This tool operates at the **developer loop** level — manual attribution of agent cost to git commits. For **production pipeline** cost attribution (per-request, per-tenant, per-model), see architectures like [turnpike](https://github.com/lucianareynaud/turnpike), which instruments LLM gateways with OpenTelemetry for real-time cost, latency, and drift observability.
 
 The two tools tell the same story at different scales: **cost without granular attribution is invisible cost.**
 
